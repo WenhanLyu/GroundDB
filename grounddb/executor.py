@@ -886,7 +886,73 @@ def _eval_expr(node: ASTNode, row: Dict[str, Any], storage: Optional[Storage] = 
                 return row[func_key]
             raise KeyError(f"Aggregate result {func_key!r} not found in row")
 
-        # Other functions (UPPER, LOWER, etc.)
+        # SUBSTR / SUBSTRING function (identifier-based)
+        if node.name in ("SUBSTR", "SUBSTRING"):
+            if len(node.args) >= 3:
+                s = _eval_expr(node.args[0], row, storage)
+                start = int(_eval_expr(node.args[1], row, storage))
+                length = int(_eval_expr(node.args[2], row, storage))
+                if s is None:
+                    return None
+                s = str(s)
+                return s[start-1:start-1+length]
+            elif len(node.args) == 2:
+                s = _eval_expr(node.args[0], row, storage)
+                start = int(_eval_expr(node.args[1], row, storage))
+                if s is None:
+                    return None
+                s = str(s)
+                return s[start-1:]
+            return None
+
+        # EXTRACT_YEAR, EXTRACT_MONTH, EXTRACT_DAY
+        if node.name.startswith("EXTRACT_"):
+            unit = node.name.split("_", 1)[1]
+            val = _eval_expr(node.args[0], row, storage)
+            if val is None:
+                return None
+            from datetime import datetime as _dt
+            if isinstance(val, str):
+                dt = _dt.strptime(val[:10], "%Y-%m-%d")
+            else:
+                dt = val
+            if unit == "YEAR":
+                return dt.year
+            elif unit == "MONTH":
+                return dt.month
+            elif unit == "DAY":
+                return dt.day
+            return None
+
+        # COALESCE function
+        if node.name == "COALESCE":
+            for arg in node.args:
+                v = _eval_expr(arg, row, storage)
+                if v is not None:
+                    return v
+            return None
+
+        # UPPER function
+        if node.name == "UPPER":
+            v = _eval_expr(node.args[0], row, storage)
+            return str(v).upper() if v is not None else None
+
+        # LOWER function
+        if node.name == "LOWER":
+            v = _eval_expr(node.args[0], row, storage)
+            return str(v).lower() if v is not None else None
+
+        # TRIM function
+        if node.name == "TRIM":
+            v = _eval_expr(node.args[0], row, storage)
+            return str(v).strip() if v is not None else None
+
+        # CAST function (simplified)
+        if node.name == "CAST":
+            v = _eval_expr(node.args[0], row, storage)
+            return v  # simplified: just return the value
+
+        # Other functions: try looking up in row
         name_lower = node.name.lower()
         if name_lower in row:
             return row[name_lower]

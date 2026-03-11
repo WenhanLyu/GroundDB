@@ -818,9 +818,27 @@ class Parser:
         if tok.type == TokenType.KEYWORD and tok.value == "CASE":
             return self.parse_case()
 
-        # Identifier (possibly table.column)
+        # Identifier: could be function call like substr(...), coalesce(...), extract(...)
+        # or table.column reference
         if tok.type == TokenType.IDENTIFIER:
             name = self.advance().value
+            # Check for function call: identifier followed by LPAREN
+            if self.peek().type == TokenType.LPAREN:
+                self.expect(type=TokenType.LPAREN)
+                # Special handling for EXTRACT(YEAR/MONTH/DAY FROM expr)
+                if name.lower() == "extract":
+                    unit_tok = self.peek()
+                    if unit_tok.type == TokenType.KEYWORD and unit_tok.value in ("YEAR", "MONTH", "DAY"):
+                        unit = self.advance().value
+                        self.expect(TokenType.KEYWORD, "FROM")
+                        arg = self.parse_expression()
+                        self.expect(type=TokenType.RPAREN)
+                        return FunctionCall("EXTRACT_" + unit, [arg])
+                args = []
+                if self.peek().type != TokenType.RPAREN:
+                    args = self.parse_expression_list()
+                self.expect(type=TokenType.RPAREN)
+                return FunctionCall(name, args)
             if self.peek().type == TokenType.DOT:
                 self.advance()
                 col = self.advance().value
