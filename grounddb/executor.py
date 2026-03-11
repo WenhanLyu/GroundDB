@@ -97,6 +97,19 @@ def execute_select(stmt: SelectStatement, storage: Storage, outer_row: Optional[
         if stmt.limit is not None:
             results = results[:stmt.limit]
 
+        # Remove any extra columns added for HAVING evaluation that aren't in SELECT
+        select_keys = set()
+        for expr, alias in stmt.columns:
+            if isinstance(expr, StarExpr):
+                select_keys = None
+                break
+            select_keys.add(alias or _expr_name(expr))
+        if select_keys is not None:
+            cleaned = []
+            for r in results:
+                cleaned.append({k: v for k, v in r.items() if k in select_keys})
+            results = cleaned
+
         return results
     else:
         # No aggregates — simple projection
