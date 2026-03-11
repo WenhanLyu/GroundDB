@@ -5,10 +5,9 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 
 ## Architecture Overview
 - **SQL Parser**: Recursive-descent parser for a SQL subset covering all TPC-H queries
-- **Storage Engine**: In-memory columnar/row store, loads TPC-H pipe-delimited data
-- **Query Planner**: Logical plan builder with predicate pushdown, join ordering
+- **Storage Engine**: In-memory row store, loads TPC-H pipe-delimited data
 - **Query Executor**: Hash joins, nested-loop joins, aggregates, sorts, LIMIT
-- **TPC-H Harness**: Data generation (dbgen), query runner, SQLite cross-validation
+- **TPC-H Harness**: Data generation (generate_tpch.py), query runner, SQLite cross-validation
 
 ## Key SQL Features Needed (from TPC-H analysis)
 - SELECT with expressions, CASE WHEN, arithmetic
@@ -31,7 +30,7 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 - Implement basic SQL parser: SELECT col FROM table WHERE simple_condition
 - Implement basic executor for single-table queries
 - Test harness: load TPC-H data, run Q6 (simple single-table aggregate)
-- Status: PENDING
+- **Status: COMPLETE** (actual: 1 cycle — Q6 cross-validation passes)
 
 ### M2: Core SQL — JOINs, GROUP BY, ORDER BY, LIMIT (Cycles: 8)
 - INNER JOIN (hash join implementation)
@@ -41,16 +40,18 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 - ORDER BY (multi-column)
 - LIMIT
 - Arithmetic and CASE WHEN expressions
-- Target: Pass TPC-H Q1, Q6, Q14 (simpler queries)
-- Status: PENDING
+- Table aliases (e.g., `lineitem l`, `orders o`)
+- Target: Pass TPC-H Q1, Q6, Q14, Q3, Q5 (core join + aggregate queries)
+- **Status: IN PROGRESS**
 
 ### M3: Subqueries and Advanced SQL (Cycles: 10)
 - Non-correlated subqueries (IN, EXISTS, scalar subqueries)
-- Correlated subqueries (EXISTS with correlation)
+- Correlated subqueries (EXISTS with correlation, NOT EXISTS)
 - String functions (SUBSTRING, UPPER, LOWER, TRIM)
-- Date comparisons and arithmetic
+- Date comparisons and arithmetic (interval arithmetic)
 - Multi-level subqueries
-- Target: Pass TPC-H Q2, Q4, Q11, Q15, Q17, Q20, Q22
+- UNION / INTERSECT
+- Target: Pass TPC-H Q2, Q4, Q11, Q15, Q17, Q18, Q20, Q21, Q22
 - Status: PENDING
 
 ### M4: Full TPC-H Pass + Performance (Cycles: 10)
@@ -61,12 +62,15 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 - Status: PENDING
 
 ## Lessons Learned
-- (none yet — project just started)
+- M1 took only 1 cycle (estimated 6) — Leo implemented full skeleton quickly
+- Q6 (single-table aggregate) passes cross-validation against SQLite
+- Parser already has KEYWORD stubs for JOIN/subqueries but executor doesn't implement them yet
+- M2 estimates may also be aggressive — be ready to break down if needed
 
 ## Cycle Budget Tracking
 | Milestone | Estimated | Actual |
 |-----------|-----------|--------|
-| M1        | 6         | -      |
+| M1        | 6         | 1      |
 | M2        | 8         | -      |
 | M3        | 10        | -      |
 | M4        | 10        | -      |
