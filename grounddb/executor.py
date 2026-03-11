@@ -175,6 +175,9 @@ def _execute_multi_table(stmt: SelectStatement, storage: Storage, materialized_t
             new_row = {}
             for col, val in row.items():
                 new_row[f"{key}.{col}"] = val
+                # Also store with original table name if alias differs
+                if alias and alias != table_name:
+                    new_row[f"{table_name}.{col}"] = val
                 new_row[col] = val  # also store bare name
             prefixed.append(new_row)
         table_rows[key] = prefixed
@@ -204,6 +207,9 @@ def _execute_multi_table(stmt: SelectStatement, storage: Storage, materialized_t
             new_row = {}
             for col, val in row.items():
                 new_row[f"{alias}.{col}"] = val
+                # Also store with original table name if alias differs
+                if join_info['alias'] and join_info['alias'] != table_name:
+                    new_row[f"{table_name}.{col}"] = val
                 new_row[col] = val
             right_rows.append(new_row)
 
@@ -575,6 +581,18 @@ def _try_optimize_exists(node: ExistsExpr, storage: Storage):
         return
     
     inner_col_name, outer_col_ref = equi_preds[0]
+    
+    # Bail out if any filter predicate has external references
+    # (can't pre-evaluate without outer row context)
+    own_tables_set = set()
+    for t, a in subquery.from_tables:
+        if isinstance(t, str):
+            own_tables_set.add(t)
+        if a:
+            own_tables_set.add(a)
+    for fp in filter_preds:
+        if _has_external_refs(fp, own_tables_set):
+            return
     
     # Pre-compute: for each row in inner table, check filter conditions
     # and collect inner_col values into a set
