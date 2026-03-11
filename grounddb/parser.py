@@ -3,9 +3,11 @@ Tokenizer and recursive-descent SQL parser for GroundDB.
 
 Supports a SQL subset sufficient for TPC-H queries:
 - SELECT with expressions, aggregates, aliases
-- FROM single table (extendable to JOINs)
+- FROM single or multiple tables (comma-join, INNER JOIN, LEFT OUTER JOIN)
 - WHERE with AND/OR, comparisons, BETWEEN, IN, date literals
 - GROUP BY, HAVING, ORDER BY, LIMIT
+- CASE WHEN ... THEN ... ELSE ... END
+- INTERVAL literals and date arithmetic
 """
 
 import re
@@ -53,6 +55,7 @@ KEYWORDS = {
     "TRUE", "FALSE",
     "CAST",
     "SUBSTRING", "UPPER", "LOWER", "TRIM",
+    "DAY", "MONTH", "YEAR",
 }
 
 
@@ -163,7 +166,9 @@ class ASTNode:
 class SelectStatement(ASTNode):
     def __init__(self):
         self.columns = []       # list of (expr, alias)
-        self.from_table = None  # table name string
+        self.from_table = None  # table name string (first table, for backward compat)
+        self.from_tables = []   # list of (table_name, alias) pairs
+        self.joins = []         # list of {'type': 'INNER'|'LEFT OUTER', 'table': str, 'alias': str|None, 'on': ASTNode}
         self.where = None       # expression node
         self.group_by = []      # list of expression nodes
         self.having = None      # expression node
@@ -207,6 +212,26 @@ class DateLiteral(ASTNode):
 
     def __repr__(self):
         return f"DateLiteral({self.value!r})"
+
+
+class IntervalLiteral(ASTNode):
+    """INTERVAL 'N' DAY|MONTH|YEAR literal."""
+    def __init__(self, n: int, unit: str):
+        self.n = n
+        self.unit = unit.upper()
+
+    def __repr__(self):
+        return f"IntervalLiteral({self.n}, {self.unit!r})"
+
+
+class CaseExpr(ASTNode):
+    """CASE WHEN cond THEN val ... ELSE val END."""
+    def __init__(self, when_clauses: list, else_expr: ASTNode = None):
+        self.when_clauses = when_clauses  # list of (condition, result) pairs
+        self.else_expr = else_expr
+
+    def __repr__(self):
+        return f"CaseExpr(whens={len(self.when_clauses)}, has_else={self.else_expr is not None})"
 
 
 class BinaryOp(ASTNode):
@@ -256,6 +281,12 @@ class Parser:
     def peek(self) -> Token:
         return self.tokens[self.pos]
 
+    def peek_ahead(self, offset: int = 1) -> Token:
+        idx = self.pos + offset
+        if idx < len(self.tokens):
+            return self.tokens[idx]
+        return self.tokens[-1]  # EOF
+
     def advance(self) -> Token:
         tok = self.tokens[self.pos]
         self.pos += 1
@@ -297,7 +328,7 @@ class Parser:
 
         # FROM
         self.expect(TokenType.KEYWORD, "FROM")
-        stmt.from_table = self.parse_table_name()
+        self._parse_from_clause(stmt)
 
         # WHERE
         if self.check_keyword("WHERE"):
@@ -328,6 +359,87 @@ class Parser:
             stmt.limit = int(tok.value)
 
         return stmt
+
+    def _parse_from_clause(self, stmt: SelectStatement):
+        """Parse FROM clause with support for multiple tables and JOINs."""
+        # Parse first table + optional alias
+        table_name, alias = self._parse_table_ref()
+        stmt.from_tables = [(table_name, alias)]
+        stmt.from_table = table_name  # backward compat
+
+        # Check for comma-separated tables or JOINs
+        while True:
+            tok = self.peek()
+
+            # Comma-separated tables
+            if tok.type == TokenType.COMMA:
+                self.advance()
+                tname, talias = self._parse_table_ref()
+                stmt.from_tables.append((tname, talias))
+                continue
+
+            # INNER JOIN / JOIN
+            if self.check_keyword("JOIN") or self.check_keyword("INNER"):
+                join_type = "INNER"
+                if self.check_keyword("INNER"):
+                    self.advance()
+                self.expect(TokenType.KEYWORD, "JOIN")
+                tname, talias = self._parse_table_ref()
+                self.expect(TokenType.KEYWORD, "ON")
+                on_expr = self.parse_expression()
+                stmt.joins.append({
+                    'type': join_type,
+                    'table': tname,
+                    'alias': talias,
+                    'on': on_expr,
+                })
+                continue
+
+            # LEFT [OUTER] JOIN
+            if self.check_keyword("LEFT"):
+                self.advance()
+                if self.check_keyword("OUTER"):
+                    self.advance()
+                self.expect(TokenType.KEYWORD, "JOIN")
+                tname, talias = self._parse_table_ref()
+                self.expect(TokenType.KEYWORD, "ON")
+                on_expr = self.parse_expression()
+                stmt.joins.append({
+                    'type': 'LEFT OUTER',
+                    'table': tname,
+                    'alias': talias,
+                    'on': on_expr,
+                })
+                continue
+
+            # CROSS JOIN
+            if self.check_keyword("CROSS"):
+                self.advance()
+                self.expect(TokenType.KEYWORD, "JOIN")
+                tname, talias = self._parse_table_ref()
+                stmt.from_tables.append((tname, talias))
+                continue
+
+            break
+
+    def _parse_table_ref(self) -> Tuple[str, Optional[str]]:
+        """Parse a table reference: table_name [alias] or table_name AS alias."""
+        tok = self.advance()
+        table_name = tok.value.lower()
+        alias = None
+
+        # Check for alias
+        if self.match_keyword("AS"):
+            alias = self.advance().value.lower()
+        elif self.peek().type == TokenType.IDENTIFIER:
+            # Check it's not a keyword that starts next clause
+            next_val = self.peek().value.upper()
+            if next_val not in ("WHERE", "GROUP", "ORDER", "LIMIT", "HAVING",
+                                "JOIN", "INNER", "LEFT", "RIGHT", "OUTER",
+                                "CROSS", "ON"):
+                alias = self.advance().value.lower()
+
+        return (table_name, alias)
 
     def parse_select_list(self) -> list:
         """Parse comma-separated select expressions with optional aliases."""
@@ -493,6 +605,20 @@ class Parser:
     def parse_primary(self) -> ASTNode:
         tok = self.peek()
 
+        # INTERVAL literal: INTERVAL 'N' DAY|MONTH|YEAR
+        if tok.type == TokenType.KEYWORD and tok.value == "INTERVAL":
+            self.advance()
+            n_str = self.expect(TokenType.STRING).value
+            n = int(n_str)
+            # Expect DAY, MONTH, or YEAR
+            unit_tok = self.peek()
+            if unit_tok.type == TokenType.KEYWORD and unit_tok.value in ("DAY", "MONTH", "YEAR"):
+                self.advance()
+                return IntervalLiteral(n, unit_tok.value)
+            else:
+                # Default to DAY if no unit specified
+                return IntervalLiteral(n, "DAY")
+
         # DATE literal: DATE 'YYYY-MM-DD'
         if tok.type == TokenType.KEYWORD and tok.value == "DATE":
             self.advance()
@@ -561,9 +687,22 @@ class Parser:
     def parse_case(self) -> ASTNode:
         """Parse CASE WHEN ... THEN ... ELSE ... END."""
         self.expect(TokenType.KEYWORD, "CASE")
-        # For now, simple CASE WHEN support
-        # We'll represent it as a special node but it's not needed for Q6
-        raise NotImplementedError("CASE WHEN not yet implemented")
+        when_clauses = []
+        else_expr = None
+
+        while self.check_keyword("WHEN"):
+            self.advance()
+            condition = self.parse_expression()
+            self.expect(TokenType.KEYWORD, "THEN")
+            result = self.parse_expression()
+            when_clauses.append((condition, result))
+
+        if self.check_keyword("ELSE"):
+            self.advance()
+            else_expr = self.parse_expression()
+
+        self.expect(TokenType.KEYWORD, "END")
+        return CaseExpr(when_clauses, else_expr)
 
 
 def parse_sql(sql: str) -> SelectStatement:
