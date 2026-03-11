@@ -70,6 +70,20 @@ def execute_select(stmt: SelectStatement, storage: Storage, outer_row: Optional[
     # Restore original from_tables
     stmt.from_tables = stmt_from_tables_original
 
+    # Resolve SELECT alias references in GROUP BY and ORDER BY
+    if stmt.group_by:
+        alias_map_sel = {}
+        for expr, alias in stmt.columns:
+            if alias:
+                alias_map_sel[alias.lower()] = expr
+        resolved_group_by = []
+        for gb_expr in stmt.group_by:
+            if isinstance(gb_expr, ColumnRef) and gb_expr.table is None and gb_expr.name.lower() in alias_map_sel:
+                resolved_group_by.append(alias_map_sel[gb_expr.name.lower()])
+            else:
+                resolved_group_by.append(gb_expr)
+        stmt.group_by = resolved_group_by
+
     if has_aggregates and not stmt.group_by:
         # Single-group aggregate
         result_row = _compute_aggregates(stmt.columns, rows, storage=storage)
@@ -277,11 +291,9 @@ def _comma_join(stmt, table_rows, alias_map, storage):
     """Handle comma-separated FROM with equi-join extraction from WHERE."""
     aliases = [alias if alias else tname for tname, alias in stmt.from_tables]
 
-    # Start with first table
-    result = table_rows[aliases[0]]
-
     if stmt.where is None:
         # Pure cross product (rare but possible)
+        result = table_rows[aliases[0]]
         for i in range(1, len(aliases)):
             new_result = []
             for left_row in result:
@@ -298,28 +310,45 @@ def _comma_join(stmt, table_rows, alias_map, storage):
     or_common_preds = _extract_common_equi_from_or(stmt.where)
     equi_preds.extend(or_common_preds)
 
-    # For each subsequent table, find an equi-join predicate and use hash join
-    joined_aliases = {aliases[0]}
+    # Reorder tables to maximize equi-join usage (greedy: always pick a table
+    # that has an equi-join key to already-joined tables; start with largest table)
+    remaining = set(aliases)
+    # Start with the largest table to filter early
+    start_alias = max(remaining, key=lambda a: len(table_rows[a]))
+    remaining.remove(start_alias)
+    result = table_rows[start_alias]
+    joined_aliases = {start_alias}
 
-    for i in range(1, len(aliases)):
-        next_alias = aliases[i]
-        # Find equi-join predicate connecting next_alias to any already-joined alias
-        join_key = _find_join_key(equi_preds, next_alias, joined_aliases, alias_map)
-
-        if join_key:
-            left_key_name, right_key_name = join_key
-            result = _hash_join(result, table_rows[next_alias],
+    while remaining:
+        # Find a table that has an equi-join key to joined tables
+        best_alias = None
+        best_join_key = None
+        for candidate in remaining:
+            jk = _find_join_key(equi_preds, candidate, joined_aliases, alias_map)
+            if jk:
+                best_alias = candidate
+                best_join_key = jk
+                break
+        
+        if best_alias is None:
+            # No equi-join found — pick smallest remaining for cross product
+            best_alias = min(remaining, key=lambda a: len(table_rows[a]))
+        
+        if best_join_key:
+            left_key_name, right_key_name = best_join_key
+            result = _hash_join(result, table_rows[best_alias],
                                 left_key_name, right_key_name, 'INNER')
         else:
             # Cross product fallback
             new_result = []
             for left_row in result:
-                for right_row in table_rows[next_alias]:
+                for right_row in table_rows[best_alias]:
                     merged = {**left_row, **right_row}
                     new_result.append(merged)
             result = new_result
 
-        joined_aliases.add(next_alias)
+        joined_aliases.add(best_alias)
+        remaining.remove(best_alias)
 
     return result
 
@@ -640,25 +669,60 @@ def _try_optimize_exists(node: ExistsExpr, storage: Storage):
     
     inner_col_name, outer_col_ref = equi_preds[0]
     
-    # Bail out if any filter predicate has external references
-    # (can't pre-evaluate without outer row context)
+    # Check if any filter predicate has external references
     own_tables_set = set()
     for t, a in subquery.from_tables:
         if isinstance(t, str):
             own_tables_set.add(t)
         if a:
             own_tables_set.add(a)
+    
+    has_external_filters = False
+    internal_filters = []
+    external_filters = []
     for fp in filter_preds:
         if _has_external_refs(fp, own_tables_set):
-            return
+            has_external_filters = True
+            external_filters.append(fp)
+        else:
+            internal_filters.append(fp)
     
-    # Pre-compute: for each row in inner table, check filter conditions
-    # and collect inner_col values into a set
+    if has_external_filters:
+        # Build an index: inner_col_value -> [matching inner rows]
+        # At eval time, look up by equi-join key, then check external filters
+        index = {}
+        alias = subquery.from_tables[0][1]
+        for row in table.rows:
+            # Check internal filter predicates
+            passes = True
+            for fp in internal_filters:
+                if not _eval_expr(fp, row, storage):
+                    passes = False
+                    break
+            if passes:
+                val = row.get(inner_col_name)
+                if val is not None:
+                    if val not in index:
+                        index[val] = []
+                    # Store row with alias prefix for outer row merge
+                    prefixed = {}
+                    key = alias if alias else table_ref
+                    for col, v in row.items():
+                        prefixed[f"{key}.{col}"] = v
+                        prefixed[col] = v
+                    index[val].append(prefixed)
+        
+        node._optimized_index = True
+        node._index = index
+        node._outer_col_ref = outer_col_ref
+        node._external_filters = external_filters
+        return
+    
+    # Pure internal filters — use simple set optimization
     qualifying_values = set()
     for row in table.rows:
-        # Check filter predicates
         passes = True
-        for fp in filter_preds:
+        for fp in internal_filters:
             if not _eval_expr(fp, row, storage):
                 passes = False
                 break
@@ -667,7 +731,6 @@ def _try_optimize_exists(node: ExistsExpr, storage: Storage):
             if val is not None:
                 qualifying_values.add(val)
     
-    # Cache on the node
     node._optimized = True
     node._qualifying_values = qualifying_values
     node._outer_col_ref = outer_col_ref
@@ -852,6 +915,21 @@ def _eval_expr(node: ASTNode, row: Dict[str, Any], storage: Optional[Storage] = 
         if hasattr(node, '_optimized') and node._optimized:
             outer_val = _eval_expr(node._outer_col_ref, row, storage)
             exists = outer_val in node._qualifying_values
+        elif hasattr(node, '_optimized_index') and node._optimized_index:
+            # Index-based optimization: look up by equi-join key, then check external filters
+            outer_val = _eval_expr(node._outer_col_ref, row, storage)
+            matching_rows = node._index.get(outer_val, [])
+            exists = False
+            for inner_row in matching_rows:
+                merged = {**row, **inner_row}
+                all_pass = True
+                for fp in node._external_filters:
+                    if not _eval_expr(fp, merged, storage):
+                        all_pass = False
+                        break
+                if all_pass:
+                    exists = True
+                    break
         else:
             sub_results = execute_select(node.subquery, storage, outer_row=row)
             exists = len(sub_results) > 0
