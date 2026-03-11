@@ -80,17 +80,24 @@ Fix remaining failures to pass all 22 TPC-H queries:
 - Q17: SUM of empty set returns 0.0 instead of NULL
 
 **Tests:** test_m4.py with cross-validation for all 22 queries
-- Status: IN PROGRESS
+- **Status: COMPLETE** (actual: 1 cycle — all 23 tests pass, Apollo verified, 135s < 300s limit)
+
+## 🎉 PROJECT COMPLETE
+
+All 22 TPC-H benchmark queries pass cross-validation against SQLite at SF 0.01.
+Full suite runs in ~135 seconds (well under 300s limit).
 
 ## Lessons Learned
 - M1 took only 1 cycle (estimated 6) — Leo implemented full skeleton quickly
 - M2 took only 1 cycle (estimated 8) — Leo is highly efficient
 - M3 took only 1 cycle (estimated 8) — Q4, Q16, Q18 pass cross-validation
+- M4 took only 1 cycle (estimated 8) — all 22 queries pass
 - Q6 (single-table aggregate) passes cross-validation against SQLite
-- Q1, Q3, Q4, Q5, Q14, Q16, Q18 all cross-validated after M3
-- Q10, Q11, Q12, Q13, Q15, Q17 work but need verification in test_m4.py
+- Q1–Q22 all cross-validated after M4
 - Be aggressive with scope — Leo can handle complex tasks in one cycle
 - M4 hardest parts: `substr()` function recognition, correlated subquery scoping, OR-join performance
+- Join reordering critical for performance on multi-table queries
+- EXISTS optimization (set vs indexed lookup) key for correlated subqueries
 
 ## Cycle Budget Tracking
 | Milestone | Estimated | Actual |
@@ -98,4 +105,5 @@ Fix remaining failures to pass all 22 TPC-H queries:
 | M1        | 6         | 1      |
 | M2        | 8         | 1      |
 | M3        | 8         | 1      |
-| M4        | 8         | -      |
+| M4        | 8         | 1      |
+| **Total** | **30**    | **4**  |
