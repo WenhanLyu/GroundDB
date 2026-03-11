@@ -1166,6 +1166,10 @@ def _eval_aggregate_expr(node: ASTNode, rows: List[dict], storage: Optional[Stor
         left = _eval_aggregate_expr(node.left, rows, storage) if _contains_aggregate(node.left) else _eval_expr(node.left, rows[0] if rows else {}, storage)
         right = _eval_aggregate_expr(node.right, rows, storage) if _contains_aggregate(node.right) else _eval_expr(node.right, rows[0] if rows else {}, storage)
 
+        # Propagate NULL: if either operand is None (from empty aggregate), result is None
+        if left is None or right is None:
+            return None
+
         if node.op == "+":
             return _numeric(left) + _numeric(right)
         if node.op == "-":
