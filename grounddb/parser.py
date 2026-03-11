@@ -8,6 +8,7 @@ Supports a SQL subset sufficient for TPC-H queries:
 - GROUP BY, HAVING, ORDER BY, LIMIT
 - CASE WHEN ... THEN ... ELSE ... END
 - INTERVAL literals and date arithmetic
+- Subqueries: EXISTS, IN (SELECT ...), scalar subqueries, derived tables
 """
 
 import re
@@ -56,6 +57,7 @@ KEYWORDS = {
     "CAST",
     "SUBSTRING", "UPPER", "LOWER", "TRIM",
     "DAY", "MONTH", "YEAR",
+    "FOR",
 }
 
 
@@ -167,7 +169,7 @@ class SelectStatement(ASTNode):
     def __init__(self):
         self.columns = []       # list of (expr, alias)
         self.from_table = None  # table name string (first table, for backward compat)
-        self.from_tables = []   # list of (table_name, alias) pairs
+        self.from_tables = []   # list of (table_name_or_subquery, alias) pairs
         self.joins = []         # list of {'type': 'INNER'|'LEFT OUTER', 'table': str, 'alias': str|None, 'on': ASTNode}
         self.where = None       # expression node
         self.group_by = []      # list of expression nodes
@@ -269,6 +271,45 @@ class StarExpr(ASTNode):
     pass
 
 
+class SubqueryExpr(ASTNode):
+    """A scalar subquery: (SELECT ...) used as a value."""
+    def __init__(self, subquery: SelectStatement):
+        self.subquery = subquery
+
+    def __repr__(self):
+        return f"SubqueryExpr(...)"
+
+
+class InSubqueryExpr(ASTNode):
+    """expr IN (SELECT ...) or expr NOT IN (SELECT ...)."""
+    def __init__(self, expr: ASTNode, subquery: SelectStatement, negated: bool = False):
+        self.expr = expr
+        self.subquery = subquery
+        self.negated = negated
+
+    def __repr__(self):
+        neg = "NOT " if self.negated else ""
+        return f"InSubqueryExpr({neg}IN)"
+
+
+class ExistsExpr(ASTNode):
+    """EXISTS (SELECT ...) or NOT EXISTS (SELECT ...)."""
+    def __init__(self, subquery: SelectStatement, negated: bool = False):
+        self.subquery = subquery
+        self.negated = negated
+
+    def __repr__(self):
+        neg = "NOT " if self.negated else ""
+        return f"ExistsExpr({neg}EXISTS)"
+
+
+class DerivedTable(ASTNode):
+    """A subquery used as a table in FROM clause: (SELECT ...) AS alias."""
+    def __init__(self, subquery: SelectStatement, alias: str):
+        self.subquery = subquery
+        self.alias = alias
+
+
 # ── Parser ───────────────────────────────────────────────────────────────────
 
 class Parser:
@@ -310,6 +351,14 @@ class Parser:
     def check_keyword(self, keyword: str) -> bool:
         tok = self.peek()
         return tok.type == TokenType.KEYWORD and tok.value.upper() == keyword.upper()
+
+    def _is_subquery_start(self) -> bool:
+        """Check if current position is '(' followed by SELECT."""
+        if self.peek().type == TokenType.LPAREN:
+            next_tok = self.peek_ahead(1)
+            if next_tok.type == TokenType.KEYWORD and next_tok.value == "SELECT":
+                return True
+        return False
 
     def parse(self) -> SelectStatement:
         """Parse a SELECT statement."""
@@ -361,11 +410,14 @@ class Parser:
         return stmt
 
     def _parse_from_clause(self, stmt: SelectStatement):
-        """Parse FROM clause with support for multiple tables and JOINs."""
+        """Parse FROM clause with support for multiple tables, JOINs, and derived tables."""
         # Parse first table + optional alias
-        table_name, alias = self._parse_table_ref()
-        stmt.from_tables = [(table_name, alias)]
-        stmt.from_table = table_name  # backward compat
+        table_ref, alias = self._parse_table_ref()
+        stmt.from_tables = [(table_ref, alias)]
+        if isinstance(table_ref, str):
+            stmt.from_table = table_ref  # backward compat
+        else:
+            stmt.from_table = alias  # derived table: use alias as table name
 
         # Check for comma-separated tables or JOINs
         while True:
@@ -374,8 +426,8 @@ class Parser:
             # Comma-separated tables
             if tok.type == TokenType.COMMA:
                 self.advance()
-                tname, talias = self._parse_table_ref()
-                stmt.from_tables.append((tname, talias))
+                tref, talias = self._parse_table_ref()
+                stmt.from_tables.append((tref, talias))
                 continue
 
             # INNER JOIN / JOIN
@@ -384,12 +436,12 @@ class Parser:
                 if self.check_keyword("INNER"):
                     self.advance()
                 self.expect(TokenType.KEYWORD, "JOIN")
-                tname, talias = self._parse_table_ref()
+                tref, talias = self._parse_table_ref()
                 self.expect(TokenType.KEYWORD, "ON")
                 on_expr = self.parse_expression()
                 stmt.joins.append({
                     'type': join_type,
-                    'table': tname,
+                    'table': tref,
                     'alias': talias,
                     'on': on_expr,
                 })
@@ -401,12 +453,12 @@ class Parser:
                 if self.check_keyword("OUTER"):
                     self.advance()
                 self.expect(TokenType.KEYWORD, "JOIN")
-                tname, talias = self._parse_table_ref()
+                tref, talias = self._parse_table_ref()
                 self.expect(TokenType.KEYWORD, "ON")
                 on_expr = self.parse_expression()
                 stmt.joins.append({
                     'type': 'LEFT OUTER',
-                    'table': tname,
+                    'table': tref,
                     'alias': talias,
                     'on': on_expr,
                 })
@@ -416,14 +468,31 @@ class Parser:
             if self.check_keyword("CROSS"):
                 self.advance()
                 self.expect(TokenType.KEYWORD, "JOIN")
-                tname, talias = self._parse_table_ref()
-                stmt.from_tables.append((tname, talias))
+                tref, talias = self._parse_table_ref()
+                stmt.from_tables.append((tref, talias))
                 continue
 
             break
 
-    def _parse_table_ref(self) -> Tuple[str, Optional[str]]:
-        """Parse a table reference: table_name [alias] or table_name AS alias."""
+    def _parse_table_ref(self):
+        """Parse a table reference: table_name [alias], table_name AS alias,
+        or (SELECT ...) AS alias (derived table).
+        Returns (table_name_or_SelectStatement, alias)."""
+        # Check for derived table: (SELECT ...)
+        if self._is_subquery_start():
+            self.advance()  # consume LPAREN
+            subquery = self.parse_select()
+            self.expect(type=TokenType.RPAREN)
+            # Must have an alias
+            alias = None
+            if self.match_keyword("AS"):
+                alias = self.advance().value.lower()
+            elif self.peek().type == TokenType.IDENTIFIER:
+                alias = self.advance().value.lower()
+            if alias is None:
+                raise SyntaxError("Derived table (subquery in FROM) requires an alias")
+            return (subquery, alias)
+
         tok = self.advance()
         table_name = tok.value.lower()
         alias = None
@@ -515,8 +584,23 @@ class Parser:
     def parse_not_expr(self) -> ASTNode:
         if self.check_keyword("NOT"):
             self.advance()
+            # Check for NOT EXISTS
+            if self.check_keyword("EXISTS"):
+                self.advance()
+                self.expect(type=TokenType.LPAREN)
+                subquery = self.parse_select()
+                self.expect(type=TokenType.RPAREN)
+                return ExistsExpr(subquery, negated=True)
+            # Check for NOT IN at this level (for standalone NOT IN after parse_comparison)
             operand = self.parse_not_expr()
             return UnaryOp("NOT", operand)
+        # Check for EXISTS
+        if self.check_keyword("EXISTS"):
+            self.advance()
+            self.expect(type=TokenType.LPAREN)
+            subquery = self.parse_select()
+            self.expect(type=TokenType.RPAREN)
+            return ExistsExpr(subquery, negated=False)
         return self.parse_comparison()
 
     def parse_comparison(self) -> ASTNode:
@@ -530,7 +614,7 @@ class Parser:
             high = self.parse_addition()
             return BetweenExpr(left, low, high)
 
-        # NOT BETWEEN
+        # NOT BETWEEN / NOT IN / NOT LIKE
         if self.check_keyword("NOT"):
             saved = self.pos
             self.advance()
@@ -540,15 +624,37 @@ class Parser:
                 self.expect(TokenType.KEYWORD, "AND")
                 high = self.parse_addition()
                 return UnaryOp("NOT", BetweenExpr(left, low, high))
+            if self.check_keyword("IN"):
+                self.advance()
+                self.expect(type=TokenType.LPAREN)
+                # Check if this is a subquery: (SELECT ...)
+                if self.check_keyword("SELECT"):
+                    subquery = self.parse_select()
+                    self.expect(type=TokenType.RPAREN)
+                    return InSubqueryExpr(left, subquery, negated=True)
+                else:
+                    values = self.parse_expression_list()
+                    self.expect(type=TokenType.RPAREN)
+                    return UnaryOp("NOT", BinaryOp("IN", left, values))
+            if self.check_keyword("LIKE"):
+                self.advance()
+                right = self.parse_addition()
+                return BinaryOp("NOT LIKE", left, right)
             self.pos = saved
 
         # IN
         if self.check_keyword("IN"):
             self.advance()
             self.expect(type=TokenType.LPAREN)
-            values = self.parse_expression_list()
-            self.expect(type=TokenType.RPAREN)
-            return BinaryOp("IN", left, values)
+            # Check if this is a subquery: (SELECT ...)
+            if self.check_keyword("SELECT"):
+                subquery = self.parse_select()
+                self.expect(type=TokenType.RPAREN)
+                return InSubqueryExpr(left, subquery, negated=False)
+            else:
+                values = self.parse_expression_list()
+                self.expect(type=TokenType.RPAREN)
+                return BinaryOp("IN", left, values)
 
         # IS NULL / IS NOT NULL
         if self.check_keyword("IS"):
@@ -625,9 +731,41 @@ class Parser:
             date_str = self.expect(TokenType.STRING).value
             return DateLiteral(date_str)
 
+        # EXISTS (SELECT ...)
+        if tok.type == TokenType.KEYWORD and tok.value == "EXISTS":
+            self.advance()
+            self.expect(type=TokenType.LPAREN)
+            subquery = self.parse_select()
+            self.expect(type=TokenType.RPAREN)
+            return ExistsExpr(subquery, negated=False)
+
+        # SUBSTRING function with FROM/FOR syntax
+        if tok.type == TokenType.KEYWORD and tok.value == "SUBSTRING":
+            func_name = self.advance().value
+            self.expect(type=TokenType.LPAREN)
+            # Parse first argument (the string expression)
+            arg1 = self.parse_expression()
+            args = [arg1]
+            # Check for FROM keyword (SUBSTRING(expr FROM n FOR m))
+            if self.check_keyword("FROM"):
+                self.advance()
+                arg2 = self.parse_expression()
+                args.append(arg2)
+                if self.check_keyword("FOR"):
+                    self.advance()
+                    arg3 = self.parse_expression()
+                    args.append(arg3)
+            else:
+                # Comma-separated args
+                while self.peek().type == TokenType.COMMA:
+                    self.advance()
+                    args.append(self.parse_expression())
+            self.expect(type=TokenType.RPAREN)
+            return FunctionCall(func_name, args)
+
         # Aggregate / function call
         if tok.type == TokenType.KEYWORD and tok.value in ("SUM", "AVG", "COUNT", "MIN", "MAX",
-                                                            "SUBSTRING", "UPPER", "LOWER", "TRIM", "CAST"):
+                                                            "UPPER", "LOWER", "TRIM", "CAST"):
             func_name = self.advance().value
             self.expect(type=TokenType.LPAREN)
 
@@ -642,6 +780,13 @@ class Parser:
                 args = self.parse_expression_list()
             self.expect(type=TokenType.RPAREN)
             return FunctionCall(func_name, args, distinct)
+
+        # Subquery in parens: (SELECT ...)
+        if self._is_subquery_start():
+            self.advance()  # consume LPAREN
+            subquery = self.parse_select()
+            self.expect(type=TokenType.RPAREN)
+            return SubqueryExpr(subquery)
 
         # Parenthesized expression
         if tok.type == TokenType.LPAREN:
