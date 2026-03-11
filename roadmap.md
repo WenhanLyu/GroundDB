@@ -17,9 +17,12 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 - HAVING clauses
 - ORDER BY (multi-column, ASC/DESC)
 - LIMIT
-- Correlated and non-correlated subqueries
+- Correlated and non-correlated subqueries (IN, EXISTS, scalar)
+- Subqueries in FROM clause (derived tables)
 - String functions (SUBSTRING, UPPER, etc.)
 - Date arithmetic (date comparisons, interval arithmetic)
+- COUNT(DISTINCT)
+- UNION ALL
 
 ## Milestones
 
@@ -42,35 +45,49 @@ Build a from-scratch, pure-Python SQL database engine (GroundDB) that correctly 
 - Arithmetic and CASE WHEN expressions
 - Table aliases (e.g., `lineitem l`, `orders o`)
 - Target: Pass TPC-H Q1, Q6, Q14, Q3, Q5 (core join + aggregate queries)
-- **Status: IN PROGRESS**
+- **Status: COMPLETE** (actual: 1 cycle — all 12 tests pass, Apollo verified)
 
-### M3: Subqueries and Advanced SQL (Cycles: 10)
-- Non-correlated subqueries (IN, EXISTS, scalar subqueries)
-- Correlated subqueries (EXISTS with correlation, NOT EXISTS)
-- String functions (SUBSTRING, UPPER, LOWER, TRIM)
-- Date comparisons and arithmetic (interval arithmetic)
-- Multi-level subqueries
-- UNION / INTERSECT
-- Target: Pass TPC-H Q2, Q4, Q11, Q15, Q17, Q18, Q20, Q21, Q22
-- Status: PENDING
+### M3: Subqueries and Advanced SQL (Cycles: 8)
+Key missing feature: subquery support. This covers the bulk of remaining TPC-H queries.
 
-### M4: Full TPC-H Pass + Performance (Cycles: 10)
+**Parser additions:**
+- Subquery as expression: `(SELECT ...) = value` or `(SELECT ...)` standalone
+- IN/NOT IN subquery: `expr IN (SELECT ...)`, `expr NOT IN (SELECT ...)`
+- EXISTS/NOT EXISTS: `EXISTS (SELECT ...)`, `NOT EXISTS (SELECT ...)`
+- Subquery in FROM: `(SELECT ... FROM ...) AS alias` (derived tables)
+- SUBSTRING function: `SUBSTRING(col FROM n FOR m)`
+
+**Executor additions:**
+- Subquery evaluation (recursive, with storage context)
+- Correlated subquery support (pass outer row as context)
+- EXISTS/NOT EXISTS evaluation
+
+**Target queries:** Q4, Q11, Q13, Q15, Q16, Q17, Q18, Q20, Q21, Q22
+(Also verify Q2, Q7, Q8, Q9, Q10, Q12 with existing features)
+
+**Tests:** test_m3.py with cross-validation for Q4, Q16, Q17, Q18, Q21 vs SQLite
+- Status: IN PROGRESS
+
+### M4: Full TPC-H Pass + Performance (Cycles: 8)
 - Pass all 22 TPC-H queries correctly
+- Handle any remaining edge cases
 - Optimize for 300-second total runtime
-- Performance improvements: better join ordering, column pruning
 - Final validation: cross-validate all 22 queries against SQLite
 - Status: PENDING
 
 ## Lessons Learned
 - M1 took only 1 cycle (estimated 6) — Leo implemented full skeleton quickly
+- M2 took only 1 cycle (estimated 8) — Leo is highly efficient
 - Q6 (single-table aggregate) passes cross-validation against SQLite
-- Parser already has KEYWORD stubs for JOIN/subqueries but executor doesn't implement them yet
-- M2 estimates may also be aggressive — be ready to break down if needed
+- Q1, Q3, Q5, Q14 pass cross-validation after M2
+- Parser already has stubs for SUBSTRING, EXISTS keywords; executor needs to implement them
+- Be aggressive with scope — Leo can handle complex tasks in one cycle
+- M3 is the hardest milestone due to subquery complexity; budget 8 cycles but expect fewer
 
 ## Cycle Budget Tracking
 | Milestone | Estimated | Actual |
 |-----------|-----------|--------|
 | M1        | 6         | 1      |
-| M2        | 8         | -      |
-| M3        | 10        | -      |
-| M4        | 10        | -      |
+| M2        | 8         | 1      |
+| M3        | 8         | -      |
+| M4        | 8         | -      |
