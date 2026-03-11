@@ -224,6 +224,55 @@ def _execute_multi_table(stmt: SelectStatement, storage: Storage, materialized_t
     return rows
 
 
+def _extract_common_equi_from_or(node):
+    """Extract equi-join predicates common to all branches of a top-level OR.
+    
+    If WHERE is (A AND join1 AND ...) OR (B AND join1 AND ...) OR ..., 
+    and join1 appears in all branches, return [join1].
+    """
+    # Collect all OR branches
+    branches = []
+    _collect_or_branches(node, branches)
+    if len(branches) < 2:
+        return []
+    
+    # For each branch, extract equi-join predicates
+    branch_preds = []
+    for branch in branches:
+        preds = _extract_all_equi_predicates(branch)
+        # Convert to frozenset of (col1_name, col2_name) tuples for comparison
+        pred_set = set()
+        for l, r in preds:
+            l_key = (l.table, l.name) if l.table else (None, l.name)
+            r_key = (r.table, r.name) if r.table else (None, r.name)
+            pred_set.add((l_key, r_key))
+        branch_preds.append(pred_set)
+    
+    # Find intersection of all branches
+    common = branch_preds[0]
+    for bp in branch_preds[1:]:
+        common = common & bp
+    
+    if not common:
+        return []
+    
+    # Convert back to (ColumnRef, ColumnRef) format
+    from .parser import ColumnRef
+    result = []
+    for (l_table, l_name), (r_table, r_name) in common:
+        result.append((ColumnRef(l_name, l_table), ColumnRef(r_name, r_table)))
+    return result
+
+
+def _collect_or_branches(node, branches):
+    """Collect all branches of a top-level OR expression."""
+    if isinstance(node, BinaryOp) and node.op == "OR":
+        _collect_or_branches(node.left, branches)
+        _collect_or_branches(node.right, branches)
+    else:
+        branches.append(node)
+
+
 def _comma_join(stmt, table_rows, alias_map, storage):
     """Handle comma-separated FROM with equi-join extraction from WHERE."""
     aliases = [alias if alias else tname for tname, alias in stmt.from_tables]
@@ -242,8 +291,12 @@ def _comma_join(stmt, table_rows, alias_map, storage):
             result = new_result
         return result
 
-    # Extract all equi-join predicates from WHERE
+    # Extract all equi-join predicates from WHERE (top-level AND)
     equi_preds = _extract_all_equi_predicates(stmt.where)
+    
+    # Also extract equi-join predicates common across all OR branches
+    or_common_preds = _extract_common_equi_from_or(stmt.where)
+    equi_preds.extend(or_common_preds)
 
     # For each subsequent table, find an equi-join predicate and use hash join
     joined_aliases = {aliases[0]}
