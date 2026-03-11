@@ -339,7 +339,25 @@ def _resolve_column_alias(col, joined_aliases, next_alias, alias_map):
 def _guess_alias_from_column(col_name, joined_aliases, next_alias):
     """Guess which alias a column belongs to based on naming conventions."""
     all_aliases = list(joined_aliases) + [next_alias]
-    # TPC-H convention: column prefix maps to table name
+    table = _column_to_table_name(col_name)
+    if table:
+        if table in all_aliases:
+            return table
+        # Check if any alias maps to this table (via alias_map if available)
+        # For now, return the table name even if not in all_aliases
+        # This ensures correct ownership identification
+        return table
+    # Fallback: first letter match
+    if "_" in col_name:
+        col_prefix = col_name[0]
+        for alias in all_aliases:
+            if alias[0] == col_prefix:
+                return alias
+    return None
+
+
+def _column_to_table_name(col_name):
+    """Determine the canonical table name for a column based on TPC-H naming convention."""
     _TABLE_COL_PREFIX = {
         'l_': 'lineitem', 'o_': 'orders', 'c_': 'customer',
         's_': 'supplier', 'p_': 'part', 'ps_': 'partsupp',
@@ -348,20 +366,7 @@ def _guess_alias_from_column(col_name, joined_aliases, next_alias):
     # Try longer prefixes first (ps_ before p_)
     for prefix in sorted(_TABLE_COL_PREFIX.keys(), key=len, reverse=True):
         if col_name.startswith(prefix):
-            table = _TABLE_COL_PREFIX[prefix]
-            if table in all_aliases:
-                return table
-            # Also check aliases that might map to this table
-            for alias in all_aliases:
-                if alias == table:
-                    return alias
-            break
-    # Fallback: first letter match
-    if "_" in col_name:
-        col_prefix = col_name[0]
-        for alias in all_aliases:
-            if alias[0] == col_prefix:
-                return alias
+            return _TABLE_COL_PREFIX[prefix]
     return None
 
 
